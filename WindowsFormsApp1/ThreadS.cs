@@ -1,44 +1,93 @@
 ﻿using System.Threading;
 using System.Collections.Generic;
+//using Debug = UnityEngine.Debug;
+using System;
+
 
 //https://docs.microsoft.com/en-us/dotnet/api/system.threading.manualresetevent?redirectedfrom=MSDN&view=netframework-4.8
 
-namespace ThreadS
+namespace RangerV
 {
     public delegate void ThreadSStart();
     public delegate void ParameterizedThreadSStart(object o);
 
+    /// <summary>
+    /// как пользоваться:
+    /// есть несколько способов:
+    ///     1) добавить некоторую функцию на выполнение с помощью функции StartThread, StartThreadNow
+    ///         ThreadManager.StartThread() - функция запустится в одном из следующих кадров
+    ///         ThreadManager.StartThreadNow() - функция запустится моментально
+    ///         
+    ///     2) с помощью TaskInfo, при данном способе появляется возможность отслеживать состояние выполнения функции с помощью публичных полей TaskInfo (см. класс TaskInfo)
+    ///         ThreadManager.TaskInfo taskInfo = ThreadManager.TaskInfo.StartNew() или ThreadManager.TaskInfo.StartNewNow()
+    ///             StartNew() - функция запустится в одном из следующих кадров
+    ///             StartNewNow() - функция запустится моментально
+    ///         вызов потока занимает примерно 0,03 мс
+    /// </summary>
     sealed class ThreadManager
     {
         #region Options
 
-        const int start_thread_pool_size = 50;
-        const int max_thread_pool_size = 50;
-        const int max_start_threads_per_update = 50;
+        const int start_thread_pool_size = 40;
+        const int max_thread_pool_size = 40;
+        const int max_start_threads_per_update = 40;
+        const int num_of_standby_thread = 10; // количество потоков, которых смогут сипользоваться только в функции *Now (StartThreadNow, например)
 
         #endregion Options
 
+        public static int Num_of_free_thread { get => FreeThreadStack.Count; }
+
         static int current_thread_pool_size;
-        static ThreadVoid[] ThreadPool;
+        static Stack<WorkThread> FreeThreadStack;
         static Queue<TaskContainer> Tasks;
+        static bool init;
+
+        static ThreadManager()
+        {
+            if (!init)
+                Init();
+        }
+
+        public void OnAwake()
+        {
+            Init();
+        }
+
+        public void CustomUpdate()
+        {
+            StartTasks();
+        }
 
         public static void Init()
         {
             current_thread_pool_size = 0;
-            ThreadPool = new ThreadVoid[max_thread_pool_size];
+            FreeThreadStack = new Stack<WorkThread>();
             Tasks = new Queue<TaskContainer>();
 
             for (int id = 0; id < start_thread_pool_size; id++)
+                PushToThreadStack(new WorkThread(id));
+
+            current_thread_pool_size = start_thread_pool_size;
+            init = true;
+        }
+
+        static void PushToThreadStack(WorkThread workThread)
+        {
+            lock (FreeThreadStack)
             {
-                ThreadPool[id] = new ThreadVoid(id);
-                current_thread_pool_size = id + 1;
+                FreeThreadStack.Push(workThread);
             }
         }
 
-        public static void Update()
+        static WorkThread PopFromThreadStack()
         {
-            StartTasks();
+            lock (FreeThreadStack)
+            {
+                return FreeThreadStack.Pop();
+            }
         }
+
+        #region Start Thread
 
         public static void StartThread(ThreadSStart threadSStart)
         {
@@ -50,80 +99,79 @@ namespace ThreadS
             Tasks.Enqueue(new TaskContainer(parameterizedThreadSStart, func_param));
         }
 
-        public static ThreadInfo StartControlledThread(ThreadSStart threadSStart)
+        public static void StartThread(TaskContainer taskContainer)
         {
-            ThreadInfo threadInfo = new ThreadInfo();
-            Tasks.Enqueue(new TaskContainer(threadSStart, threadInfo));
-            return threadInfo;
+            Tasks.Enqueue(taskContainer);
         }
 
-        public static ThreadInfo StartControlledThread(ParameterizedThreadSStart parameterizedThreadSStart, object func_param)
+        public static void StartThreadNow(ThreadSStart threadSStart)
         {
-            ThreadInfo threadInfo = new ThreadInfo();
-            Tasks.Enqueue(new TaskContainer(parameterizedThreadSStart, func_param, threadInfo));
-            return threadInfo;
+            if (!(FreeThreadStack.Count > 0))
+            {
+                AddThread();
+            }
+
+            PopFromThreadStack().Start(new TaskContainer(threadSStart));
         }
+
+        public static void StartThreadNow(ParameterizedThreadSStart parameterizedThreadSStart, object func_param)
+        {
+            if (!(FreeThreadStack.Count > 0))
+            {
+                AddThread();
+            }
+
+            PopFromThreadStack().Start(new TaskContainer(parameterizedThreadSStart, func_param));
+        }
+
+        public static void StartThreadNow(TaskContainer taskContainer)
+        {
+            if (!(FreeThreadStack.Count > 0))
+            {
+                AddThread();
+            }
+
+            PopFromThreadStack().Start(taskContainer);
+        }
+
+        #endregion Start Thread
 
         static void StartTasks()
         {
             int num_of_start_thread = 0;
+            int count = Tasks.Count;
 
-            for (int i = 0; i < current_thread_pool_size; i++)
+            for (int i = 0; i < count; i++)
             {
-                if (num_of_start_thread > max_start_threads_per_update || Tasks.Count == 0)
+                if (num_of_start_thread > max_start_threads_per_update)
                     return;
 
-                if (!ThreadPool[i].is_active)
+                if (FreeThreadStack.Count > num_of_standby_thread)
                 {
-                    ThreadPool[i].Start(Tasks.Dequeue());
+                    PopFromThreadStack().Start(Tasks.Dequeue());
                     num_of_start_thread++;
                 }
             }
             TryAddThread();
         }
 
-        static void TryAddThread()
+        static bool TryAddThread()
         {
             if (current_thread_pool_size < max_thread_pool_size)
             {
-                ThreadPool[current_thread_pool_size] = new ThreadVoid(current_thread_pool_size);
-                current_thread_pool_size++;
+                FreeThreadStack.Push(new WorkThread(current_thread_pool_size++));
+                return true;
             }
+            return false;
         }
 
-        public static int ShowNumOfTasks()
+        static void AddThread()
         {
-            return Tasks.Count;
+            FreeThreadStack.Push(new WorkThread(current_thread_pool_size++));
         }
 
-        #region Наработки
-
-        public void RemoveThread(int thread_id)
+        class WorkThread : IDisposable //переименовать
         {
-            ThreadPool[thread_id] = null;
-        }
-
-        static void RestartMissingThreads()
-        {
-            for (int i = 0; i < current_thread_pool_size; i++)
-            {
-                if (ThreadPool[i] == null)
-                    ThreadPool[i] = new ThreadVoid(i);
-            }
-        }
-
-        static void RestartMissingThreads(int thread_id)
-        {
-            if (ThreadPool[thread_id] == null)
-                ThreadPool[thread_id] = new ThreadVoid(thread_id);
-        }
-
-        #endregion
-
-
-        class ThreadVoid //переименовать
-        {
-            public bool is_active { get; protected set; }
             public int id { get; private set; }
 
             private ManualResetEventSlim manualReset;
@@ -132,12 +180,11 @@ namespace ThreadS
             private Thread thread;
             private bool need_stop_thread;
 
-            public ThreadVoid(int id)
+            public WorkThread(int id)
             {
                 manualReset = new ManualResetEventSlim(false);
                 StartFunc = new ThreadSStart(ThreadStart);
                 need_stop_thread = false;
-                is_active = false;
                 this.id = id;
 
                 thread = new Thread(new ThreadStart(ThreadStart));
@@ -147,7 +194,6 @@ namespace ThreadS
 
             public void Start(TaskContainer taskContainer)
             {
-                is_active = true;
                 this.taskContainer = taskContainer;
                 manualReset.Set();
             }
@@ -157,15 +203,14 @@ namespace ThreadS
                 while (!need_stop_thread)
                 {
                     manualReset.Reset();
-                    is_active = false;
                     manualReset.Wait();
                     taskContainer.WorkFunk();
+                    PushToThreadStack(this);
                 }
             }
 
             public void StopThread()
             {
-                is_active = true;
                 need_stop_thread = true;
                 manualReset.Set();
             }
@@ -174,46 +219,83 @@ namespace ThreadS
             {
                 thread.Abort();
             }
+
+            #region Dispose
+
+            private bool disposed = false;
+
+            // реализация интерфейса IDisposable.
+            public void Dispose()
+            {
+                Dispose(true);
+                // подавляем финализацию
+                GC.SuppressFinalize(this);
+            }
+
+            protected virtual void Dispose(bool disposing)
+            {
+                if (!disposed)
+                {
+                    if (disposing)
+                    {
+                        // Освобождаем управляемые ресурсы
+                    }
+                    // освобождаем неуправляемые объекты
+                    manualReset.Dispose();
+                    disposed = true;
+                }
+            }
+
+            // Деструктор
+            ~WorkThread()
+            {
+                Dispose(false);
+            }
+
+            #endregion Dispose
         }
 
-        struct TaskContainer
+        public class TaskContainer
         {
             bool is_void_func;
-            ThreadInfo threadInfo;
+            TaskInfo taskInfo;
             ThreadSStart threadSStart;
             ParameterizedThreadSStart parameterizedThreadSStart;
             object o;
 
-            public TaskContainer(ThreadSStart threadSStart, ThreadInfo threadInfo = null)
+            public TaskContainer(ThreadSStart threadSStart, TaskInfo threadInfo = null)
             {
                 this.threadSStart = threadSStart;
-                this.threadInfo = threadInfo;
-                this.parameterizedThreadSStart = null;
-                this.o = null;
-                this.is_void_func = true;
+                this.taskInfo = threadInfo;
+                parameterizedThreadSStart = null;
+                o = null;
+                is_void_func = true;
             }
 
-            public TaskContainer(ParameterizedThreadSStart parameterizedThreadSStart, object o, ThreadInfo threadInfo = null)
+            public TaskContainer(ParameterizedThreadSStart parameterizedThreadSStart, object o, TaskInfo threadInfo = null)
             {
                 this.parameterizedThreadSStart = parameterizedThreadSStart;
                 this.o = o;
-                this.threadInfo = threadInfo;
+                this.taskInfo = threadInfo;
                 this.threadSStart = null;
                 this.is_void_func = false;
             }
 
             public void WorkFunk()
             {
-                if (threadInfo != null)
+                if (taskInfo != null)
                 {
-                    threadInfo.is_start = true;
+                    lock (taskInfo.to_lock)
+                    {
+                        taskInfo.is_start = true;
 
-                    if (is_void_func)
-                        threadSStart();
-                    else
-                        parameterizedThreadSStart(o);
+                        if (is_void_func)
+                            threadSStart();
+                        else
+                            parameterizedThreadSStart(o);
 
-                    threadInfo.is_complete = true;
+                        taskInfo.is_complete = true;
+                    }
                 }
                 else
                 {
@@ -224,17 +306,71 @@ namespace ThreadS
                 }
             }
         }
-    }
 
-    class ThreadInfo
-    {
-        public bool is_start;
-        public bool is_complete;
-
-        public ThreadInfo(bool is_start = false, bool is_complete = false)
+        public sealed class TaskInfo
         {
-            this.is_start = false;
-            this.is_complete = false;
+            TaskContainer taskContainer;
+            public bool is_start;
+            public bool is_complete;
+            public object to_lock; // блокируется до конца выполнения заданной функции
+            public object _out; // пока не используется
+
+            public TaskInfo(ThreadSStart Funk)
+            {
+                _out = null;
+                is_start = false;
+                is_complete = false;
+                to_lock = new object();
+                taskContainer = new TaskContainer(Funk, this);
+            }
+
+            public TaskInfo(ParameterizedThreadSStart Funk, object o)
+            {
+                _out = null;
+                is_start = false;
+                is_complete = false;
+                to_lock = new object();
+                taskContainer = new TaskContainer(Funk, o, this);
+            }
+
+            // стартует поток на выполнение, но не сразу, а как появяться сободные ресурсы для этого
+            public void Start()
+            {
+                Tasks.Enqueue(taskContainer);
+            }
+
+            public void StartNow()
+            {
+                StartThreadNow(taskContainer);
+            }
+
+            public static TaskInfo StartNew(ThreadSStart Funk)
+            {
+                TaskInfo threadInfo = new TaskInfo(Funk);
+                threadInfo.Start();
+                return threadInfo;
+            }
+
+            public static TaskInfo StartNew(ParameterizedThreadSStart Funk, object o)
+            {
+                TaskInfo threadInfo = new TaskInfo(Funk, o);
+                threadInfo.Start();
+                return threadInfo;
+            }
+
+            public static TaskInfo StartNewNow(ThreadSStart Funk)
+            {
+                TaskInfo threadInfo = new TaskInfo(Funk);
+                threadInfo.StartNow();
+                return threadInfo;
+            }
+
+            public static TaskInfo StartNewNow(ParameterizedThreadSStart Funk, object o)
+            {
+                TaskInfo threadInfo = new TaskInfo(Funk, o);
+                threadInfo.StartNow();
+                return threadInfo;
+            }
         }
     }
 }
